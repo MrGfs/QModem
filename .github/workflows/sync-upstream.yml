@@ -32,6 +32,8 @@ jobs:
       - name: Add upstream remote and fetch
         run: |
           git remote add upstream https://github.com/FUjr/QModem.git || git remote set-url upstream https://github.com/FUjr/QModem.git
+          # 同时拉取本仓库的 upstream 镜像分支，用于精准判断上游是否真有更新
+          git fetch origin upstream || true
           git fetch upstream main
 
       - name: Capture reapply patch before rebuild
