@@ -1,0 +1,71 @@
+name: Sync upstream QModem and reapply patch
+
+# 当上游 FUjr/QModem 更新时，把本仓库的改动（antenna_signal 实时天线信号方法）重新叠加到最新上游之上。
+# 触发：每 6 小时定时 / 手动 workflow_dispatch / 外部 repository_dispatch (event_type: upstream-update)
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [upstream-update]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom (build branch)
+        uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/FUjr/QModem.git || git remote set-url upstream https://github.com/FUjr/QModem.git
+          git fetch upstream main
+
+      - name: Capture reapply patch before rebuild
+        run: |
+          # patch 随 custom 分支一起携带；重建前先导出，避免 reset 后丢失
+          git show HEAD:patches/antenna-signal.patch > /tmp/antenna-signal.patch || true
+          if [ ! -s /tmp/antenna-signal.patch ]; then
+            echo "::error::patches/antenna-signal.patch missing on custom branch"
+            exit 1
+          fi
+
+      - name: Detect upstream change
+        id: chk
+        run: |
+          UP=$(git rev-parse upstream/main)
+          US=$(git rev-parse origin/upstream 2>/dev/null || echo none)
+          echo "upstream_head=$UP"
+          echo "mirror_head=$US"
+          if [ "$UP" != "$US" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else echo "changed=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Rebuild custom = upstream + patch
+        if: steps.chk.outputs.changed == 'true'
+        run: |
+          UP=$(git rev-parse upstream/main)
+          # 1) 更新纯上游镜像分支 upstream
+          git checkout -B upstream upstream/main
+          git push origin upstream
+          # 2) 在最新上游之上重建 custom，叠加本仓库改动
+          git checkout -B custom upstream/main
+          cp /tmp/antenna-signal.patch patches/antenna-signal.patch
+          if ! git apply /tmp/antenna-signal.patch; then
+            echo "::warning::plain git apply failed, retrying with --3way"
+            git apply --3way /tmp/antenna-signal.patch
+          fi
+          git add -A
+          git commit -m "reapply antenna_signal patch on upstream ${UP:0:9}" || echo "nothing to commit"
+          git push --force-with-lease origin custom

@@ -476,3 +476,47 @@ ubus call qmodem info '{"config_section":"modem1"}'
 - The config_section must exist in `/etc/config/qmodem`
 - Vendor-specific functionality is loaded from `/usr/share/qmodem/vendor/` based on the modem manufacturer
 - AT command language (Chinese/English) is automatically selected based on system language settings
+
+## antenna_signal (Real-time per-antenna signal + rate factors)
+
+Returns per-antenna RSRP/RSRQ/SINR plus rate-shaping factors (bandwidth, CA count, MIMO
+rank, band, PCI, netmode/rat) for antenna placement / tuning dashboards and time-series logging.
+
+This method is **real-time**: it does NOT use the 10-second cache used by `info` / `network_info`.
+All AT queries are sent through the managed `tom_modem` channel (the `cmd_*` wrappers), so it
+never opens `/dev/tty*` directly and does not contend with QModem's own polling.
+
+### Request
+```bash
+ubus call qmodem antenna_signal '{"config_section":"modem1"}'
+```
+
+### Response (example, Quectel RM520N-GL, ENDC)
+```json
+{
+  "config_section": "modem1",
+  "timestamp": 1762135800,
+  "antenna_rsrp": [-74, -75, -99, -76],
+  "antenna_rsrq": [-12.1, -12.5, -14.0, -13.0],
+  "antenna_sinr": [21.0, 18.0, 5.0, 12.0],
+  "netmode": "ENDC",
+  "rat": "NR5G",
+  "band": "78",
+  "pci": "123",
+  "bandwidth_mhz": 100,
+  "ca_count": 2,
+  "mimo_rank": 4
+}
+```
+
+### Field notes
+- `antenna_rsrp` / `antenna_rsrq` / `antenna_sinr` are arrays of up to 4 values (MAIN/DIV/MIMO1/MIMO2).
+  Missing or unsupported antennas are emitted as `""`.
+- `antenna_rsrq` and `antenna_sinr` are reported in **dB**; the raw 0.1 dB values from `+QRSRQ` / `+QRSCP`
+  are divided by 10 before returning.
+- SINR source is `+QRSCP` when available; otherwise it falls back to the aggregate NR SINR from `+QENG`.
+- `ca_count` counts PCC + SCC carriers parsed from `+QCAINFO`.
+- `mimo_rank` comes from `+QRSGR`.
+- Only Quectel modems that implement `+QRSRP`/`+QRSRQ`/`+QRSCP`/`+QRSGR` (e.g. RM520N-GL) populate the
+  per-antenna arrays; on other modems those arrays will be empty and the call still returns the
+  aggregate `netmode`/`rat`/`bandwidth_mhz` derived from `+QENG` / `+QCAINFO`.

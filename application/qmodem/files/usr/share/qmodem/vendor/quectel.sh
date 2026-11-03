@@ -546,6 +546,150 @@ network_info()
     add_speed_entry tx $tx_rate
 }
 
+# Real-time per-antenna signal + rate-factor query (Quectel RM520N-GL / SDX65).
+# No caching. All AT goes through the managed tom_modem channel via cmd_* wrappers.
+# Caller must have done json_init. We build the JSON response directly.
+# Per spec: never open /dev/tty* directly; never apply the 10s cache; divide
+# QRSRQ/QRSCP (0.1 dB) by 10 before returning.
+antenna_signal()
+{
+    m_debug "Quectel antenna_signal realtime query"
+
+    # --- fetch raw AT responses through the managed channel ---
+    local qrsp qsrq qscp qeng qcainfo qrsgr
+    qrsp=$(cmd_qrsp "$at_port" 2>/dev/null)
+    qsrq=$(cmd_qsrq "$at_port" 2>/dev/null)
+    qscp=$(cmd_qscp "$at_port" 2>/dev/null)
+    qrsgr=$(cmd_qrsgr "$at_port" 2>/dev/null)
+    qeng=$(cmd_qeng_servingcell "$at_port" 2>/dev/null)
+    qcainfo=$(cmd_qcainfo "$at_port" 2>/dev/null)
+
+    json_add_string "config_section" "$config_section"
+    json_add_string "timestamp" "$(date +%s)"
+
+    # --- per-antenna RSRP (dBm, direct) ---
+    # +QRSRP: r0,r1,r2,r3,<rat>
+    local rsrp_line=$(echo "$qrsp" | grep "+QRSRP:" | head -n1 | sed 's/+QRSRP: //; s/\r//g; s/ //g')
+    json_add_array "antenna_rsrp"
+    for i in 1 2 3 4; do
+        v=$(echo "$rsrp_line" | awk -F',' -v f=$i '{print $f}')
+        if [ -n "$v" ] && [ "$v" != "-" ]; then
+            json_add_int "" "$v"
+        else
+            json_add_string "" ""
+        fi
+    done
+    json_close_array
+
+    # --- per-antenna RSRQ (0.1 dB -> dB, divide by 10) ---
+    local rsrq_line=$(echo "$qsrq" | grep "+QRSRQ:" | head -n1 | sed 's/+QRSRQ: //; s/\r//g; s/ //g')
+    json_add_array "antenna_rsrq"
+    for i in 1 2 3 4; do
+        v=$(echo "$rsrq_line" | awk -F',' -v f=$i '{print $f}')
+        if [ -n "$v" ] && [ "$v" != "-" ]; then
+            json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $v/10}")"
+        else
+            json_add_string "" ""
+        fi
+    done
+    json_close_array
+
+    # --- per-antenna SINR (0.1 dB -> dB, divide by 10) ---
+    # Preferred source: +QRSCP. Fallback: NR SINR from QENG (aggregate, replicated).
+    local scp_line=$(echo "$qscp" | grep "+QRSCP:" | head -n1 | sed 's/+QRSCP: //; s/\r//g; s/ //g')
+    json_add_array "antenna_sinr"
+    if [ -n "$scp_line" ]; then
+        for i in 1 2 3 4; do
+            v=$(echo "$scp_line" | awk -F',' -v f=$i '{print $f}')
+            if [ -n "$v" ] && [ "$v" != "-" ]; then
+                json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $v/10}")"
+            else
+                json_add_string "" ""
+            fi
+        done
+    else
+        local nr_sinr=""
+        local nr5g_nsa=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"')
+        local nr5g_sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
+        if [ -n "$nr5g_nsa" ]; then
+            nr_sinr=$(echo "$nr5g_nsa" | awk -F',' '{print $6}')
+        elif [ -n "$nr5g_sa" ]; then
+            nr_sinr=$(echo "$nr5g_sa" | awk -F',' '{print $12}')
+        fi
+        for i in 1 2 3 4; do
+            if [ -n "$nr_sinr" ] && [ "$nr_sinr" != "-" ]; then
+                json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $nr_sinr/10}")"
+            else
+                json_add_string "" ""
+            fi
+        done
+    fi
+    json_close_array
+
+    # --- network mode / rat from QENG ---
+    local lte=$(echo "$qeng" | grep '+QENG: "LTE"')
+    local nr5g_nsa=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"')
+    local nr5g_sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
+    local netmode rat
+    if [ -n "$lte" ] && [ -n "$nr5g_nsa" ]; then
+        netmode="ENDC"; rat="NR5G"
+    elif [ -n "$nr5g_sa" ]; then
+        netmode="SA"; rat="NR5G"
+    elif [ -n "$lte" ]; then
+        netmode="LTE"; rat="LTE"
+    else
+        netmode="UNKNOWN"; rat="UNKNOWN"
+    fi
+    json_add_string "netmode" "$netmode"
+    json_add_string "rat" "$rat"
+
+    # --- band + PCI from QENG NR segment ---
+    local band_num="" pci=""
+    if [ -n "$nr5g_nsa" ]; then
+        band_num=$(echo "$nr5g_nsa" | awk -F',' '{print $9}')
+        pci=$(echo "$nr5g_nsa" | awk -F',' '{print $4}')
+    elif [ -n "$nr5g_sa" ]; then
+        band_num=$(echo "$nr5g_sa" | awk -F',' '{print $11}')
+        pci=$(echo "$nr5g_sa" | awk -F',' '{print $8}')
+    fi
+    if [ -n "$band_num" ] && [ "$band_num" != "-" ]; then
+        json_add_string "band" "$(get_band "NR" "$band_num")"
+    else
+        json_add_string "band" ""
+    fi
+    [ -n "$pci" ] && json_add_string "pci" "$pci" || json_add_string "pci" ""
+
+    # --- bandwidth (MHz) from QCAINFO PCC, fallback to QENG ---
+    local bw_num=$(echo "$qcainfo" | grep "+QCAINFO:" | grep "PCC" | awk -F',' '{print $3}' | head -n1)
+    if [ -z "$bw_num" ]; then
+        [ -n "$nr5g_nsa" ] && bw_num=$(echo "$nr5g_nsa" | awk -F',' '{print $10}')
+        [ -z "$bw_num" ] && [ -n "$nr5g_sa" ] && bw_num=$(echo "$qcainfo" | grep "+QCAINFO:" | grep "PCC" | awk -F',' '{print $3}' | head -n1)
+    fi
+    local bw_mhz=""
+    [ -n "$bw_num" ] && [ "$bw_num" != "-" ] && bw_mhz=$(get_bandwidth "NR" "$bw_num")
+    if [ -n "$bw_mhz" ] && [ "$bw_mhz" -eq "$bw_mhz" ] 2>/dev/null; then
+        json_add_int "bandwidth_mhz" "$bw_mhz"
+    else
+        json_add_string "bandwidth_mhz" ""
+    fi
+
+    # --- CA count: PCC + SCC from QCAINFO ---
+    local ca_count=0
+    if echo "$qcainfo" | grep -q "+QCAINFO:"; then
+        ca_count=$(echo "$qcainfo" | grep "+QCAINFO:" | grep -E "PCC|SCC" | wc -l)
+        [ "$ca_count" -lt 1 ] && ca_count=1
+    fi
+    json_add_int "ca_count" "$ca_count"
+
+    # --- MIMO rank from +QRSGR: <rank> ---
+    local rank=$(echo "$qrsgr" | grep "+QRSGR:" | head -n1 | sed 's/+QRSGR: //; s/\r//g; s/ //g' | awk -F',' '{print $1}')
+    if [ -n "$rank" ] && [ "$rank" -eq "$rank" ] 2>/dev/null; then
+        json_add_int "mimo_rank" "$rank"
+    else
+        json_add_int "mimo_rank" 0
+    fi
+}
+
 #获取频段
 # $1:网络类型
 # $2:频段数字

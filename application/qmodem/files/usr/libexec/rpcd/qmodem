@@ -579,6 +579,9 @@ case "$1" in
     "get_connect_status": {
         "config_section": "string"
     },
+    "antenna_signal": {
+        "config_section": "string"
+    },
     "info": {
         "config_section": "string"
     },
@@ -856,6 +859,12 @@ EOF
                         json_init
                         get_connect_status
                         json_add_string connection_status "$connect_status"
+                        json_dump
+                        ;;
+                    antenna_signal)
+                        # Real-time, NO 10s cache: must bypass try_cache on purpose.
+                        json_init
+                        antenna_signal
                         json_dump
                         ;;
                     remove_modem)

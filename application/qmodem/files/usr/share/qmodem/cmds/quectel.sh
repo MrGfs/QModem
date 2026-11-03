@@ -228,6 +228,30 @@ cmd_qcainfo()
     at "$1" "AT+QCAINFO"
 }
 
+#query per-antenna RSRP (dBm, direct)
+cmd_qrsp()
+{
+    at "$1" "AT+QRSRP?"
+}
+
+#query per-antenna RSRQ (0.1 dB, divide by 10)
+cmd_qsrq()
+{
+    at "$1" "AT+QRSRQ?"
+}
+
+#query per-antenna SINR (0.1 dB, divide by 10)
+cmd_qscp()
+{
+    at "$1" "AT+QRSCP?"
+}
+
+#query MIMO rank
+cmd_qrsgr()
+{
+    at "$1" "AT+QRSGR?"
+}
+
 #query cell lock state
 #$2: scope (common/4g, common/5g, common/lte)
 cmd_qnwlock_query()
