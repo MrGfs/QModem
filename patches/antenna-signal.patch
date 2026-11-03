@@ -1,0 +1,453 @@
+diff --git a/application/qmodem/files/usr/libexec/rpcd/qmodem b/application/qmodem/files/usr/libexec/rpcd/qmodem
+index 54bbcd1..f35bd96 100755
+--- a/application/qmodem/files/usr/libexec/rpcd/qmodem
++++ b/application/qmodem/files/usr/libexec/rpcd/qmodem
+@@ -579,6 +579,9 @@ case "$1" in
+     "get_connect_status": {
+         "config_section": "string"
+     },
++    "antenna_signal": {
++        "config_section": "string"
++    },
+     "info": {
+         "config_section": "string"
+     },
+@@ -858,6 +861,12 @@ EOF
+                         json_add_string connection_status "$connect_status"
+                         json_dump
+                         ;;
++                    antenna_signal)
++                        # Real-time, NO 10s cache: must bypass try_cache on purpose.
++                        json_init
++                        antenna_signal
++                        json_dump
++                        ;;
+                     remove_modem)
+                         json_init
+                         /usr/share/qmodem/modem_scan.sh remove "$config_section" >/dev/null 2>&1
+diff --git a/application/qmodem/files/usr/share/qmodem/cmds/quectel.sh b/application/qmodem/files/usr/share/qmodem/cmds/quectel.sh
+index 1e0f7fd..290df85 100644
+--- a/application/qmodem/files/usr/share/qmodem/cmds/quectel.sh
++++ b/application/qmodem/files/usr/share/qmodem/cmds/quectel.sh
+@@ -228,6 +228,30 @@ cmd_qcainfo()
+     at "$1" "AT+QCAINFO"
+ }
+ 
++#query per-antenna RSRP (dBm, direct)
++cmd_qrsp()
++{
++    at "$1" "AT+QRSRP?"
++}
++
++#query per-antenna RSRQ (0.1 dB, divide by 10)
++cmd_qsrq()
++{
++    at "$1" "AT+QRSRQ?"
++}
++
++#query per-antenna SINR (0.1 dB, divide by 10)
++cmd_qscp()
++{
++    at "$1" "AT+QRSCP?"
++}
++
++#query MIMO rank
++cmd_qrsgr()
++{
++    at "$1" "AT+QRSGR?"
++}
++
+ #query cell lock state
+ #$2: scope (common/4g, common/5g, common/lte)
+ cmd_qnwlock_query()
+diff --git a/application/qmodem/files/usr/share/qmodem/vendor/quectel.sh b/application/qmodem/files/usr/share/qmodem/vendor/quectel.sh
+index 16dd7f9..98038d5 100755
+--- a/application/qmodem/files/usr/share/qmodem/vendor/quectel.sh
++++ b/application/qmodem/files/usr/share/qmodem/vendor/quectel.sh
+@@ -546,6 +546,150 @@ network_info()
+     add_speed_entry tx $tx_rate
+ }
+ 
++# Real-time per-antenna signal + rate-factor query (Quectel RM520N-GL / SDX65).
++# No caching. All AT goes through the managed tom_modem channel via cmd_* wrappers.
++# Caller must have done json_init. We build the JSON response directly.
++# Per spec: never open /dev/tty* directly; never apply the 10s cache; divide
++# QRSRQ/QRSCP (0.1 dB) by 10 before returning.
++antenna_signal()
++{
++    m_debug "Quectel antenna_signal realtime query"
++
++    # --- fetch raw AT responses through the managed channel ---
++    local qrsp qsrq qscp qeng qcainfo qrsgr
++    qrsp=$(cmd_qrsp "$at_port" 2>/dev/null)
++    qsrq=$(cmd_qsrq "$at_port" 2>/dev/null)
++    qscp=$(cmd_qscp "$at_port" 2>/dev/null)
++    qrsgr=$(cmd_qrsgr "$at_port" 2>/dev/null)
++    qeng=$(cmd_qeng_servingcell "$at_port" 2>/dev/null)
++    qcainfo=$(cmd_qcainfo "$at_port" 2>/dev/null)
++
++    json_add_string "config_section" "$config_section"
++    json_add_string "timestamp" "$(date +%s)"
++
++    # --- per-antenna RSRP (dBm, direct) ---
++    # +QRSRP: r0,r1,r2,r3,<rat>
++    local rsrp_line=$(echo "$qrsp" | grep "+QRSRP:" | head -n1 | sed 's/+QRSRP: //; s/\r//g; s/ //g')
++    json_add_array "antenna_rsrp"
++    for i in 1 2 3 4; do
++        v=$(echo "$rsrp_line" | awk -F',' -v f=$i '{print $f}')
++        if [ -n "$v" ] && [ "$v" != "-" ]; then
++            json_add_int "" "$v"
++        else
++            json_add_string "" ""
++        fi
++    done
++    json_close_array
++
++    # --- per-antenna RSRQ (0.1 dB -> dB, divide by 10) ---
++    local rsrq_line=$(echo "$qsrq" | grep "+QRSRQ:" | head -n1 | sed 's/+QRSRQ: //; s/\r//g; s/ //g')
++    json_add_array "antenna_rsrq"
++    for i in 1 2 3 4; do
++        v=$(echo "$rsrq_line" | awk -F',' -v f=$i '{print $f}')
++        if [ -n "$v" ] && [ "$v" != "-" ]; then
++            json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $v/10}")"
++        else
++            json_add_string "" ""
++        fi
++    done
++    json_close_array
++
++    # --- per-antenna SINR (0.1 dB -> dB, divide by 10) ---
++    # Preferred source: +QRSCP. Fallback: NR SINR from QENG (aggregate, replicated).
++    local scp_line=$(echo "$qscp" | grep "+QRSCP:" | head -n1 | sed 's/+QRSCP: //; s/\r//g; s/ //g')
++    json_add_array "antenna_sinr"
++    if [ -n "$scp_line" ]; then
++        for i in 1 2 3 4; do
++            v=$(echo "$scp_line" | awk -F',' -v f=$i '{print $f}')
++            if [ -n "$v" ] && [ "$v" != "-" ]; then
++                json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $v/10}")"
++            else
++                json_add_string "" ""
++            fi
++        done
++    else
++        local nr_sinr=""
++        local nr5g_nsa=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"')
++        local nr5g_sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
++        if [ -n "$nr5g_nsa" ]; then
++            nr_sinr=$(echo "$nr5g_nsa" | awk -F',' '{print $6}')
++        elif [ -n "$nr5g_sa" ]; then
++            nr_sinr=$(echo "$nr5g_sa" | awk -F',' '{print $12}')
++        fi
++        for i in 1 2 3 4; do
++            if [ -n "$nr_sinr" ] && [ "$nr_sinr" != "-" ]; then
++                json_add_string "" "$(awk "BEGIN{printf \"%.1f\", $nr_sinr/10}")"
++            else
++                json_add_string "" ""
++            fi
++        done
++    fi
++    json_close_array
++
++    # --- network mode / rat from QENG ---
++    local lte=$(echo "$qeng" | grep '+QENG: "LTE"')
++    local nr5g_nsa=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"')
++    local nr5g_sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
++    local netmode rat
++    if [ -n "$lte" ] && [ -n "$nr5g_nsa" ]; then
++        netmode="ENDC"; rat="NR5G"
++    elif [ -n "$nr5g_sa" ]; then
++        netmode="SA"; rat="NR5G"
++    elif [ -n "$lte" ]; then
++        netmode="LTE"; rat="LTE"
++    else
++        netmode="UNKNOWN"; rat="UNKNOWN"
++    fi
++    json_add_string "netmode" "$netmode"
++    json_add_string "rat" "$rat"
++
++    # --- band + PCI from QENG NR segment ---
++    local band_num="" pci=""
++    if [ -n "$nr5g_nsa" ]; then
++        band_num=$(echo "$nr5g_nsa" | awk -F',' '{print $9}')
++        pci=$(echo "$nr5g_nsa" | awk -F',' '{print $4}')
++    elif [ -n "$nr5g_sa" ]; then
++        band_num=$(echo "$nr5g_sa" | awk -F',' '{print $11}')
++        pci=$(echo "$nr5g_sa" | awk -F',' '{print $8}')
++    fi
++    if [ -n "$band_num" ] && [ "$band_num" != "-" ]; then
++        json_add_string "band" "$(get_band "NR" "$band_num")"
++    else
++        json_add_string "band" ""
++    fi
++    [ -n "$pci" ] && json_add_string "pci" "$pci" || json_add_string "pci" ""
++
++    # --- bandwidth (MHz) from QCAINFO PCC, fallback to QENG ---
++    local bw_num=$(echo "$qcainfo" | grep "+QCAINFO:" | grep "PCC" | awk -F',' '{print $3}' | head -n1)
++    if [ -z "$bw_num" ]; then
++        [ -n "$nr5g_nsa" ] && bw_num=$(echo "$nr5g_nsa" | awk -F',' '{print $10}')
++        [ -z "$bw_num" ] && [ -n "$nr5g_sa" ] && bw_num=$(echo "$qcainfo" | grep "+QCAINFO:" | grep "PCC" | awk -F',' '{print $3}' | head -n1)
++    fi
++    local bw_mhz=""
++    [ -n "$bw_num" ] && [ "$bw_num" != "-" ] && bw_mhz=$(get_bandwidth "NR" "$bw_num")
++    if [ -n "$bw_mhz" ] && [ "$bw_mhz" -eq "$bw_mhz" ] 2>/dev/null; then
++        json_add_int "bandwidth_mhz" "$bw_mhz"
++    else
++        json_add_string "bandwidth_mhz" ""
++    fi
++
++    # --- CA count: PCC + SCC from QCAINFO ---
++    local ca_count=0
++    if echo "$qcainfo" | grep -q "+QCAINFO:"; then
++        ca_count=$(echo "$qcainfo" | grep "+QCAINFO:" | grep -E "PCC|SCC" | wc -l)
++        [ "$ca_count" -lt 1 ] && ca_count=1
++    fi
++    json_add_int "ca_count" "$ca_count"
++
++    # --- MIMO rank from +QRSGR: <rank> ---
++    local rank=$(echo "$qrsgr" | grep "+QRSGR:" | head -n1 | sed 's/+QRSGR: //; s/\r//g; s/ //g' | awk -F',' '{print $1}')
++    if [ -n "$rank" ] && [ "$rank" -eq "$rank" ] 2>/dev/null; then
++        json_add_int "mimo_rank" "$rank"
++    else
++        json_add_int "mimo_rank" 0
++    fi
++}
++
+ #获取频段
+ # $1:网络类型
+ # $2:频段数字
+diff --git a/docs/kwrt-integration.md b/docs/kwrt-integration.md
+new file mode 100644
+index 0000000..ec755e9
+--- /dev/null
++++ b/docs/kwrt-integration.md
+@@ -0,0 +1,71 @@
++# 把改后的 QModem 编入 Kwrt / OpenWrt / ImmortalWrt 固件
++
++目标：在 kiddin9/Kwrt（或你的 fork）构建出的固件里，包含带 `antenna_signal` 方法的 QModem，
++供 M28C（Widora MangoPi，RM520N-GL 5G 模组）的"天线信号实时可视化 + 历史记录"前端调用。
++
++## 1. 维护一个 QModem fork / 分支
++
++上游 `FUjr/QModem` 是 MPL-2.0 + 禁止商用的附加条款（见仓库 LICENSE）。本改动是增量、向后兼容，
++建议：
++
++1. Fork `FUjr/QModem` 到你账号，例如 `you/QModem`。
++2. 把本目录（含 `antenna_signal` 方法、`cmd_qrsp/qsrq/qscp/qrsgr` 封装、文档）提交到该 fork 的一个分支，例如 `feat/antenna-signal`。
++3. 后续同步上游时 rebase 该分支即可，改动不会与 `info`/`network_info`/`send_at` 冲突。
++
++## 2. 在 Kwrt 的 diy.sh / feeds 里加 feed 指向你的 fork
++
++在构建系统的 `devices/<target>/diy.sh`（或公共 `devices/common/diy.sh`）里，把原来的：
++
++```sh
++# 原（指向上游）
++echo "src-git qmodem https://github.com/FUjr/QModem.git;main" >> feeds.conf.default
++```
++
++改成指向你的分支（带 `antenna_signal`）：
++
++```sh
++# 改后（指向你的 fork + 分支）
++sed -i '/src-git qmodem/d' feeds.conf.default
++echo "src-git qmodem https://github.com/you/QModem.git;feat/antenna-signal" >> feeds.conf.default
++./scripts/feeds update qmodem
++./scripts/feeds install -a -p qmodem
++```
++
++> M28C 目标（`devices/m28c/`）的 `settings.ini` 已经把 `REPO_URL` 指向 `immortalwrt/immortalwrt`，
++> 上面的 feed 改动在两个源码树下都生效（ImmortalWrt 同样支持 QModem 的 `src-git` feed）。
++
++## 3. 确保相关内核模块被编入（5G 模组必需）
++
++在目标 `.config` 里开启（网页勾选或写死）：
++
++```sh
++CONFIG_PACKAGE_luci-app-qmodem-next=y
++CONFIG_PACKAGE_qmodem=y
++CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
++CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
++CONFIG_PACKAGE_kmod-usb-serial-option=y
++CONFIG_PACKAGE_kmod-usb-serial-wwan=y
++CONFIG_PACKAGE_proto-qmi=y
++CONFIG_PACKAGE_proto-mbim=y
++# RM520N-GL 是 PCIe(M.2) 模组，需要 MHI 驱动
++CONFIG_PACKAGE_kmod-mhi-pci-generic=y
++```
++
++## 4. 前端调用（两种写法）
++
++### 方案 B（推荐，固件已含本改动）
++```sh
++ubus call qmodem antenna_signal '{"config_section":"modem1"}'
++```
++前端定时（如 1s）轮询此接口，直接拿到 4 路天线 RSRP/RSRQ/SINR + 速率因子，落历史日志即可。
++
++### 方案 A（不刷固件、仅加 CGI）
++把 `examples/at_rsrp.cgi` 放到路由 `/www/cgi-bin/at_rsrp` 并 `chmod +x`，前端 GET
++`/cgi-bin/at_rsrp?modem1` 得到同构 JSON。前提是固件已含原版 QModem（`send_at` 存在）。
++
++## 5. 验收要点
++- `ubus call qmodem antenna_signal '{"config_section":"modem1"}'` 返回 4 路数组、bandwidth_mhz、ca_count、mimo_rank。
++- RSQR/QRSCP 已是 ÷10 后的 dB（非 0.1dB 原始值）。
++- 1 秒级连续调用无空读、无端口竞争（所有 AT 走 tom_modem 托管通道）。
++- NSA(ENDC) 与 SA(NR5G) 下均正确解析 NR 段。
++- 原 `info` / `network_info` / `send_at` / LuCI 页面不受影响。
+diff --git a/docs/qmodem-rpcd-interface.md b/docs/qmodem-rpcd-interface.md
+index c60e619..b58d2dd 100644
+--- a/docs/qmodem-rpcd-interface.md
++++ b/docs/qmodem-rpcd-interface.md
+@@ -476,3 +476,47 @@ ubus call qmodem info '{"config_section":"modem1"}'
+ - The config_section must exist in `/etc/config/qmodem`
+ - Vendor-specific functionality is loaded from `/usr/share/qmodem/vendor/` based on the modem manufacturer
+ - AT command language (Chinese/English) is automatically selected based on system language settings
++
++## antenna_signal (Real-time per-antenna signal + rate factors)
++
++Returns per-antenna RSRP/RSRQ/SINR plus rate-shaping factors (bandwidth, CA count, MIMO
++rank, band, PCI, netmode/rat) for antenna placement / tuning dashboards and time-series logging.
++
++This method is **real-time**: it does NOT use the 10-second cache used by `info` / `network_info`.
++All AT queries are sent through the managed `tom_modem` channel (the `cmd_*` wrappers), so it
++never opens `/dev/tty*` directly and does not contend with QModem's own polling.
++
++### Request
++```bash
++ubus call qmodem antenna_signal '{"config_section":"modem1"}'
++```
++
++### Response (example, Quectel RM520N-GL, ENDC)
++```json
++{
++  "config_section": "modem1",
++  "timestamp": 1762135800,
++  "antenna_rsrp": [-74, -75, -99, -76],
++  "antenna_rsrq": [-12.1, -12.5, -14.0, -13.0],
++  "antenna_sinr": [21.0, 18.0, 5.0, 12.0],
++  "netmode": "ENDC",
++  "rat": "NR5G",
++  "band": "78",
++  "pci": "123",
++  "bandwidth_mhz": 100,
++  "ca_count": 2,
++  "mimo_rank": 4
++}
++```
++
++### Field notes
++- `antenna_rsrp` / `antenna_rsrq` / `antenna_sinr` are arrays of up to 4 values (MAIN/DIV/MIMO1/MIMO2).
++  Missing or unsupported antennas are emitted as `""`.
++- `antenna_rsrq` and `antenna_sinr` are reported in **dB**; the raw 0.1 dB values from `+QRSRQ` / `+QRSCP`
++  are divided by 10 before returning.
++- SINR source is `+QRSCP` when available; otherwise it falls back to the aggregate NR SINR from `+QENG`.
++- `ca_count` counts PCC + SCC carriers parsed from `+QCAINFO`.
++- `mimo_rank` comes from `+QRSGR`.
++- Only Quectel modems that implement `+QRSRP`/`+QRSRQ`/`+QRSCP`/`+QRSGR` (e.g. RM520N-GL) populate the
++  per-antenna arrays; on other modems those arrays will be empty and the call still returns the
++  aggregate `netmode`/`rat`/`bandwidth_mhz` derived from `+QENG` / `+QCAINFO`.
+diff --git a/examples/at_rsrp.cgi b/examples/at_rsrp.cgi
+new file mode 100644
+index 0000000..8f04252
+--- /dev/null
++++ b/examples/at_rsrp.cgi
+@@ -0,0 +1,101 @@
++#!/bin/sh
++# /www/cgi-bin/at_rsrp  --  方案A: 经 ubus send_at 取分路信号，绝不直开 /dev/tty*
++# 配合 QModem 使用；部署: 放到路由 /www/cgi-bin/at_rsrp, chmod +x, 依赖 jq
++#
++# 调用:  http://<router>/cgi-bin/at_rsrp?modem1
++# 返回:  与 ubus qmodem antenna_signal 同构的 JSON
++
++echo "Content-Type: application/json"
++echo ""
++
++SECTION="${QUERY_STRING%%=*}"
++[ -z "$SECTION" ] && SECTION="modem1"
++
++# 经 QModem 托管通道透传 AT，返回响应文本
++q() {
++    ubus call qmodem send_at "{\"config_section\":\"$SECTION\",\"params\":{\"at\":\"$1\"}}" \
++        | jq -r '.at_cfg.res // empty'
++}
++
++qrsp=$(q "AT+QRSRP?")
++qsrq=$(q "AT+QRSRQ?")
++qscp=$(q "AT+QRSCP?")
++qeng=$(q 'AT+QENG="servingcell"')
++qcainfo=$(q "AT+QCAINFO")
++qrsgr=$(q "AT+QRSGR?")
++
++arr4() {  # $1=line(+QXXX: a,b,c,d,...)  $2=label
++    local line="$1" f i v
++    line=$(echo "$line" | sed "s/^+$2: //; s/\r//g; s/ //g")
++    for i in 1 2 3 4; do
++        v=$(echo "$line" | awk -F',' -v f=$i '{print $f}')
++        if [ -n "$v" ] && [ "$v" != "-" ]; then printf '%s' "$v"; else printf '""'; fi
++        [ $i -lt 4 ] && printf ','
++    done
++}
++div10() {  # 0.1dB -> dB, 4 路
++    local line="$1" f v
++    line=$(echo "$line" | sed 's/^+[A-Z]*: //; s/\r//g; s/ //g')
++    for i in 1 2 3 4; do
++        v=$(echo "$line" | awk -F',' -v f=$i '{print $f}')
++        if [ -n "$v" ] && [ "$v" != "-" ]; then awk "BEGIN{printf \"%.1f\", $v/10}"; else printf '""'; fi
++        [ $i -lt 4 ] && printf ','
++    done
++}
++
++rsrp=$(arr4 "$(echo "$qrsp" | grep '+QRSRP:' | head -n1)" "QRSRP")
++rsrq=$(div10 "$(echo "$qsrq" | grep '+QRSRQ:' | head -n1)")
++scp_line=$(echo "$qscp" | grep '+QRSCP:' | head -n1)
++if [ -n "$scp_line" ]; then
++    sinr=$(div10 "$scp_line")
++else
++    ns=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"'); sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
++    n=$( [ -n "$ns" ] && echo "$ns" | awk -F',' '{print $6}' || echo "$sa" | awk -F',' '{print $12}' )
++    s=""
++    for i in 1 2 3 4; do
++        [ -n "$n" ] && [ "$n" != "-" ] && s="${s}$(awk "BEGIN{printf \"%.1f\", $n/10}")" || s="${s}\"\""
++        [ $i -lt 4 ] && s="${s},"
++    done
++    sinr="$s"
++fi
++
++lte=$(echo "$qeng" | grep '+QENG: "LTE"')
++nsa=$(echo "$qeng" | grep '+QENG: "NR5G-NSA"')
++sa=$(echo "$qeng" | grep '+QENG: "NR5G-SA"')
++if [ -n "$lte" ] && [ -n "$nsa" ]; then netmode=ENDC; rat=NR5G
++elif [ -n "$sa" ]; then netmode=SA; rat=NR5G
++elif [ -n "$lte" ]; then netmode=LTE; rat=LTE
++else netmode=UNKNOWN; rat=UNKNOWN; fi
++
++band=""; pci=""
++if [ -n "$nsa" ]; then band=$(echo "$nsa" | awk -F',' '{print $9}'); pci=$(echo "$nsa" | awk -F',' '{print $4}')
++elif [ -n "$sa" ]; then band=$(echo "$sa" | awk -F',' '{print $11}'); pci=$(echo "$sa" | awk -F',' '{print $8}'); fi
++
++bw_num=$(echo "$qcainfo" | grep '+QCAINFO:' | grep PCC | awk -F',' '{print $3}' | head -n1)
++bw_mhz=""
++[ -n "$bw_num" ] && bw_mhz=$(echo "$bw_num" | awk '{ if($1 ~ /^[0-9]+$/) print $1*5+5; else print "" }')
++[ -z "$bw_mhz" ] && bw_mhz="\"\""
++
++ca_count=0
++echo "$qcainfo" | grep -q '+QCAINFO:' && ca_count=$(echo "$qcainfo" | grep '+QCAINFO:' | grep -E 'PCC|SCC' | wc -l)
++[ "$ca_count" -lt 1 ] && ca_count=1
++
++rank=$(echo "$qrsgr" | grep '+QRSGR:' | head -n1 | sed 's/+QRSGR: //; s/\r//g; s/ //g' | awk -F',' '{print $1}')
++[ -z "$rank" ] && rank=0
++
++cat <<EOF
++{
++  "config_section": "$SECTION",
++  "timestamp": $(date +%s),
++  "antenna_rsrp": [$rsrp],
++  "antenna_rsrq": [$rsrq],
++  "antenna_sinr": [$sinr],
++  "netmode": "$netmode",
++  "rat": "$rat",
++  "band": "$band",
++  "pci": "$pci",
++  "bandwidth_mhz": $bw_mhz,
++  "ca_count": $ca_count,
++  "mimo_rank": $rank
++}
++EOF
